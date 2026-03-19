@@ -180,3 +180,19 @@ fn fail(comptime fmt: []const u8, args: anytype) u8 {
 fn writeStderr(message: []const u8) void {
     std.fs.File.stderr().writeAll(message) catch {};
 }
+
+test "parseCommand recognizes supported commands" {
+    try std.testing.expectEqual(Command.status, parseCommand("status").?);
+    try std.testing.expectEqual(Command.watch, parseCommand("watch").?);
+    try std.testing.expectEqual(Command.debug, parseCommand("debug").?);
+    try std.testing.expectEqual(Command.raw_status, parseCommand("raw-status").?);
+    try std.testing.expectEqual(Command.disable, parseCommand("disable").?);
+    try std.testing.expectEqual(Command.enable, parseCommand("enable").?);
+    try std.testing.expectEqual(Command.limit, parseCommand("limit").?);
+}
+
+test "parseCommand rejects unknown commands" {
+    try std.testing.expect(parseCommand("raw_status") == null);
+    try std.testing.expect(parseCommand("limits") == null);
+    try std.testing.expect(parseCommand("") == null);
+}

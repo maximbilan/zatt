@@ -811,6 +811,24 @@ fn yesNo(value: bool) []const u8 {
     return if (value) "yes" else "no";
 }
 
+fn testSnapshot(
+    inhibited: bool,
+    charging_now: bool,
+    fully_charged: bool,
+    percent: u8,
+    plugged_in: bool,
+) ChargingSnapshot {
+    return .{
+        .key_name = "CHTE",
+        .inhibited = inhibited,
+        .charging_now = charging_now,
+        .charging_current = if (charging_now) 1500 else 0,
+        .fully_charged = fully_charged,
+        .percent = percent,
+        .plugged_in = plugged_in,
+    };
+}
+
 test "percentage rounds and caps at 100" {
     try std.testing.expectEqual(@as(u8, 74), percentage(74, 100));
     try std.testing.expectEqual(@as(u8, 67), percentage(2, 3));
@@ -872,66 +890,102 @@ test "charge limit fallback interprets Apple Silicon values" {
 }
 
 test "enable verification waits for charging only when it should" {
-    const unplugged = ChargingSnapshot{
-        .key_name = "CHTE",
-        .inhibited = false,
-        .charging_now = false,
-        .charging_current = 0,
-        .fully_charged = false,
-        .percent = 80,
-        .plugged_in = false,
-    };
+    const unplugged = testSnapshot(false, false, false, 80, false);
     try std.testing.expect(verificationSatisfied(.enable, unplugged));
 
-    const plugged_idle = ChargingSnapshot{
-        .key_name = "CHTE",
-        .inhibited = false,
-        .charging_now = false,
-        .charging_current = 0,
-        .fully_charged = false,
-        .percent = 80,
-        .plugged_in = true,
-    };
+    const plugged_idle = testSnapshot(false, false, false, 80, true);
     try std.testing.expect(!verificationSatisfied(.enable, plugged_idle));
+}
+
+test "disable verification waits for inhibit and charging to stop" {
+    try std.testing.expect(!verificationSatisfied(.disable, testSnapshot(false, true, false, 80, true)));
+    try std.testing.expect(!verificationSatisfied(.disable, testSnapshot(true, true, false, 80, true)));
+    try std.testing.expect(verificationSatisfied(.disable, testSnapshot(true, false, false, 80, true)));
+}
+
+test "shouldExpectCharging only when plugged in and below full" {
+    try std.testing.expect(shouldExpectCharging(testSnapshot(false, false, false, 80, true)));
+    try std.testing.expect(!shouldExpectCharging(testSnapshot(false, false, false, 80, false)));
+    try std.testing.expect(!shouldExpectCharging(testSnapshot(false, false, true, 80, true)));
+    try std.testing.expect(!shouldExpectCharging(testSnapshot(false, false, false, 100, true)));
 }
 
 test "verification results explain post-write battery state" {
     try std.testing.expectEqualStrings(
         "battery current resumed",
-        verificationResult(.enable, .{
-            .key_name = "CHTE",
-            .inhibited = false,
-            .charging_now = true,
-            .charging_current = 1500,
-            .fully_charged = false,
-            .percent = 80,
-            .plugged_in = true,
-        }, true),
+        verificationResult(.enable, testSnapshot(false, true, false, 80, true), true),
     );
     try std.testing.expectEqualStrings(
         "inhibit cleared; AC power is not connected",
-        verificationResult(.enable, .{
-            .key_name = "CHTE",
-            .inhibited = false,
-            .charging_now = false,
-            .charging_current = 0,
-            .fully_charged = false,
-            .percent = 80,
-            .plugged_in = false,
-        }, true),
+        verificationResult(.enable, testSnapshot(false, false, false, 80, false), true),
     );
     try std.testing.expectEqualStrings(
         "battery current stopped and charging inhibit is active",
-        verificationResult(.disable, .{
-            .key_name = "CHTE",
-            .inhibited = true,
-            .charging_now = false,
-            .charging_current = 0,
-            .fully_charged = false,
-            .percent = 80,
-            .plugged_in = true,
-        }, true),
+        verificationResult(.disable, testSnapshot(true, false, false, 80, true), true),
     );
+}
+
+test "verification results cover lagging and full battery cases" {
+    try std.testing.expectEqualStrings(
+        "SMC write returned, but charging inhibit is not reflected yet",
+        verificationResult(.disable, testSnapshot(false, false, false, 80, true), false),
+    );
+    try std.testing.expectEqualStrings(
+        "SMC inhibit is enabled, but battery current is still flowing",
+        verificationResult(.disable, testSnapshot(true, true, false, 80, true), false),
+    );
+    try std.testing.expectEqualStrings(
+        "inhibit cleared; battery is full, so current may stay at 0 mA",
+        verificationResult(.enable, testSnapshot(false, false, true, 100, true), true),
+    );
+    try std.testing.expectEqualStrings(
+        "SMC write returned, but charging inhibit is still enabled",
+        verificationResult(.enable, testSnapshot(true, false, false, 80, true), false),
+    );
+}
+
+test "battery state helpers fall back to power source values" {
+    const base_power = PowerSourceInfo{
+        .current_capacity = 80,
+        .max_capacity = 100,
+        .percent = 80,
+        .is_charging = false,
+        .plugged_in = true,
+        .cycles = null,
+    };
+    const base_registry = RegistryInfo{
+        .current_capacity = null,
+        .max_capacity = null,
+        .cycle_count = null,
+        .charging_current = null,
+        .charger_inhibit_reason = null,
+        .not_charging_reason = null,
+        .is_charging = null,
+        .fully_charged = null,
+        .external_connected = null,
+        .external_charge_capable = null,
+    };
+    const base_inhibit = ChargingInhibitProbe{
+        .key_name = "CHTE",
+        .byte_len = 1,
+        .inhibited = false,
+    };
+
+    var state = BatteryState{
+        .power = base_power,
+        .registry = base_registry,
+        .charging_inhibit = base_inhibit,
+        .charge_limit = null,
+        .actual_charging = false,
+    };
+    try std.testing.expect(stateIsPluggedIn(state));
+    try std.testing.expect(!stateIsFullyCharged(state));
+
+    state.registry.external_connected = false;
+    try std.testing.expect(!stateIsPluggedIn(state));
+
+    state.registry.fully_charged = true;
+    try std.testing.expect(stateIsFullyCharged(state));
 }
 
 test "observation plan keeps default writes fast and wait mode long-lived" {
