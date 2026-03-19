@@ -1,9 +1,9 @@
 class Zatt < Formula
   desc "macOS CLI to control MacBook battery charging via SMC"
   homepage "https://github.com/maximbilan/zatt"
-  url "https://github.com/maximbilan/zatt/releases/download/v0.1.1/zatt-macos-arm64.tar.gz"
-  sha256 "59f8dd1b659e9136f10f6b36a420bdc85354e73a9964a1122a4dac3d533e2e6f"
-  version "0.1.1"
+  url "https://github.com/maximbilan/zatt/releases/download/v0.1.2/zatt-macos-arm64.tar.gz"
+  sha256 "9f2c4e6b6c863d959b5ad5a65264409335afbc331c1b59efb2369b5e4e68e398"
+  version "0.1.2"
   license "MIT"
 
   depends_on arch: :arm64
