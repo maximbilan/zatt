@@ -5,6 +5,8 @@ const smc = @import("smc.zig");
 const usage_text =
     \\Usage:
     \\  zatt status
+    \\  zatt debug
+    \\  zatt raw-status
     \\  zatt disable
     \\  zatt enable
     \\  zatt limit <20-100>
@@ -29,6 +31,16 @@ fn run() u8 {
     if (std.mem.eql(u8, command, "status")) {
         if (args.next() != null) return usageError();
         return statusCommand();
+    }
+
+    if (std.mem.eql(u8, command, "debug")) {
+        if (args.next() != null) return usageError();
+        return readOnlyCommand(battery.debug);
+    }
+
+    if (std.mem.eql(u8, command, "raw-status")) {
+        if (args.next() != null) return usageError();
+        return readOnlyCommand(battery.rawStatus);
     }
 
     if (std.mem.eql(u8, command, "disable")) {
@@ -76,7 +88,11 @@ fn run() u8 {
 }
 
 fn statusCommand() u8 {
-    battery.status() catch |err| {
+    return readOnlyCommand(battery.status);
+}
+
+fn readOnlyCommand(comptime action: fn () battery.Error!void) u8 {
+    action() catch |err| {
         return switch (err) {
             error.CannotOpen => fail("Error: cannot open SMC\n", .{}),
             else => fail("Error: cannot read battery status\n", .{}),
