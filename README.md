@@ -13,11 +13,17 @@ brew install zatt
 
 ```bash
 zatt status
+zatt debug
+zatt raw-status
 sudo zatt disable
 sudo zatt enable
 sudo zatt limit 80
 sudo zatt limit reset
 ```
+
+`zatt debug` prints an interpreted charging diagnostic view for local testing.
+`zatt raw-status` dumps the raw IOPS, `AppleSmartBattery`, and SMC fields that
+back the charging state.
 
 ## Build
 
