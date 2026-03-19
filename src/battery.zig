@@ -95,19 +95,14 @@ pub fn status() Error!void {
     writer.writeAll("  Battery Status\n") catch unreachable;
     writer.writeAll("══════════════════════════════\n") catch unreachable;
 
-    const filled = @min(@as(usize, 10), (@as(usize, info.percent) + 5) / 10);
+    const filled = chargeBarSegments(info.percent);
     writer.writeAll("  Charge:       ") catch unreachable;
     for (0..10) |index| {
         writer.writeAll(if (index < filled) "█" else "░") catch unreachable;
     }
     writer.print(" {d}%\n", .{info.percent}) catch unreachable;
 
-    const charging_label = if (charging_inhibit.inhibited)
-        "disabled (inhibited)"
-    else if (info.is_charging)
-        "charging"
-    else
-        "not charging";
+    const charging_label = chargingStatusLabel(charging_inhibit.inhibited, info.is_charging);
     writer.print("  Charging:     {s}\n", .{charging_label}) catch unreachable;
     writer.print("  Plugged in:   {s}\n", .{if (info.plugged_in) "yes" else "no"}) catch unreachable;
     writer.print("  Health:       {s}\n", .{healthSlice(&info)}) catch unreachable;
@@ -170,12 +165,7 @@ pub fn debug() Error!void {
 
     const effective_is_charging = registry.is_charging orelse power.is_charging;
     const charging_current = registry.charging_current;
-    const pack_state = if (effective_is_charging)
-        "charging"
-    else if (charging_current) |current|
-        if (current > 0) "charging" else if (current < 0) "discharging" else "idle"
-    else
-        "not charging";
+    const pack_state = packStateLabel(effective_is_charging, charging_current);
 
     writer.print("  Pack state:    {s}\n", .{pack_state}) catch unreachable;
     writer.print("  Charging now:  {s}\n", .{yesNo(effectiveIsCharging(effective_is_charging, charging_current))}) catch unreachable;
@@ -187,15 +177,13 @@ pub fn debug() Error!void {
     writer.print("  Plugged in:    {s}\n", .{yesNo(registry.external_connected orelse power.plugged_in)}) catch unreachable;
 
     writer.writeAll("  Verdict:       ") catch unreachable;
-    if (effectiveIsCharging(effective_is_charging, charging_current)) {
-        writer.writeAll("battery is actively charging\n") catch unreachable;
-    } else if ((registry.fully_charged orelse false) or power.percent == 100) {
-        writer.writeAll("battery is on external power but not taking charge\n") catch unreachable;
-    } else if (charging_inhibit.inhibited) {
-        writer.writeAll("charging appears inhibited and current is not flowing into the pack\n") catch unreachable;
-    } else {
-        writer.writeAll("battery is not charging, but SMC inhibit is not enabled\n") catch unreachable;
-    }
+    writer.writeAll(debugVerdict(
+        effectiveIsCharging(effective_is_charging, charging_current),
+        registry.fully_charged orelse false,
+        power.percent,
+        charging_inhibit.inhibited,
+    )) catch unreachable;
+    writer.writeAll("\n") catch unreachable;
 
     writer.writeAll("  UI note:       macOS can show the power icon when AC is attached even if charging current is zero\n") catch unreachable;
     if ((registry.fully_charged orelse false) or power.percent == 100) {
@@ -320,6 +308,16 @@ fn percentage(current_capacity: i64, max_capacity: i64) u8 {
     return @intCast(rounded);
 }
 
+fn chargeBarSegments(percent: u8) usize {
+    if (percent == 0) return 0;
+    return @min(@as(usize, 10), @divTrunc(@as(usize, percent) + 9, 10));
+}
+
+fn chargingStatusLabel(inhibited: bool, is_charging: bool) []const u8 {
+    if (inhibited) return "disabled (inhibited)";
+    return if (is_charging) "charging" else "not charging";
+}
+
 fn readChargingInhibit(session: *smc.Session) smc.Error!bool {
     return (try probeChargingInhibit(session)).inhibited;
 }
@@ -400,7 +398,7 @@ fn probeChargeLimit(session: *smc.Session) smc.Error!ChargeLimitProbe {
     return .{
         .key_name = "CHWA",
         .raw_value = fallback,
-        .interpreted_limit = if (fallback == 1) 80 else 100,
+        .interpreted_limit = interpretChargeLimitFallback(fallback),
     };
 }
 
@@ -550,6 +548,23 @@ fn writeHexBytes(writer: anytype, bytes: []const u8) void {
     }
 }
 
+fn packStateLabel(is_charging: bool, charging_current: ?i64) []const u8 {
+    if (is_charging) return "charging";
+    if (charging_current) |current| {
+        if (current > 0) return "charging";
+        if (current < 0) return "discharging";
+        return "idle";
+    }
+    return "not charging";
+}
+
+fn debugVerdict(charging_now: bool, fully_charged: bool, percent: u8, inhibited: bool) []const u8 {
+    if (charging_now) return "battery is actively charging";
+    if (fully_charged or percent == 100) return "battery is on external power but not taking charge";
+    if (inhibited) return "charging appears inhibited and current is not flowing into the pack";
+    return "battery is not charging, but SMC inhibit is not enabled";
+}
+
 fn effectiveIsCharging(is_charging: bool, charging_current: ?i64) bool {
     if (is_charging) return true;
     if (charging_current) |current| {
@@ -558,6 +573,70 @@ fn effectiveIsCharging(is_charging: bool, charging_current: ?i64) bool {
     return false;
 }
 
+fn interpretChargeLimitFallback(raw_value: u8) u8 {
+    return if (raw_value == 1) 80 else 100;
+}
+
 fn yesNo(value: bool) []const u8 {
     return if (value) "yes" else "no";
+}
+
+test "percentage rounds and caps at 100" {
+    try std.testing.expectEqual(@as(u8, 74), percentage(74, 100));
+    try std.testing.expectEqual(@as(u8, 67), percentage(2, 3));
+    try std.testing.expectEqual(@as(u8, 100), percentage(101, 100));
+}
+
+test "charge bar segments round up to percentage buckets" {
+    try std.testing.expectEqual(@as(usize, 0), chargeBarSegments(0));
+    try std.testing.expectEqual(@as(usize, 1), chargeBarSegments(1));
+    try std.testing.expectEqual(@as(usize, 8), chargeBarSegments(74));
+    try std.testing.expectEqual(@as(usize, 10), chargeBarSegments(100));
+}
+
+test "charging status label prioritizes inhibit state" {
+    try std.testing.expectEqualStrings("disabled (inhibited)", chargingStatusLabel(true, true));
+    try std.testing.expectEqualStrings("charging", chargingStatusLabel(false, true));
+    try std.testing.expectEqualStrings("not charging", chargingStatusLabel(false, false));
+}
+
+test "pack state label reflects charging current and fallback state" {
+    try std.testing.expectEqualStrings("charging", packStateLabel(true, null));
+    try std.testing.expectEqualStrings("charging", packStateLabel(false, 500));
+    try std.testing.expectEqualStrings("discharging", packStateLabel(false, -500));
+    try std.testing.expectEqualStrings("idle", packStateLabel(false, 0));
+    try std.testing.expectEqualStrings("not charging", packStateLabel(false, null));
+}
+
+test "effective charging detection uses charging current as fallback" {
+    try std.testing.expect(effectiveIsCharging(true, null));
+    try std.testing.expect(effectiveIsCharging(false, 10));
+    try std.testing.expect(!effectiveIsCharging(false, 0));
+    try std.testing.expect(!effectiveIsCharging(false, -10));
+    try std.testing.expect(!effectiveIsCharging(false, null));
+}
+
+test "debug verdict explains the dominant charging state" {
+    try std.testing.expectEqualStrings(
+        "battery is actively charging",
+        debugVerdict(true, false, 80, true),
+    );
+    try std.testing.expectEqualStrings(
+        "battery is on external power but not taking charge",
+        debugVerdict(false, true, 100, true),
+    );
+    try std.testing.expectEqualStrings(
+        "charging appears inhibited and current is not flowing into the pack",
+        debugVerdict(false, false, 80, true),
+    );
+    try std.testing.expectEqualStrings(
+        "battery is not charging, but SMC inhibit is not enabled",
+        debugVerdict(false, false, 80, false),
+    );
+}
+
+test "charge limit fallback interprets Apple Silicon values" {
+    try std.testing.expectEqual(@as(u8, 80), interpretChargeLimitFallback(1));
+    try std.testing.expectEqual(@as(u8, 100), interpretChargeLimitFallback(0));
+    try std.testing.expectEqual(@as(u8, 100), interpretChargeLimitFallback(2));
 }

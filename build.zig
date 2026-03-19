@@ -43,6 +43,31 @@ fn addZattExecutable(
     return exe;
 }
 
+fn addBatteryTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const tests = b.addTest(.{
+        .name = "battery-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/battery.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    if (b.sysroot) |sdk_root| {
+        tests.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_root, "System/Library/Frameworks" }) });
+    }
+
+    tests.linkFramework("IOKit");
+    tests.linkFramework("CoreFoundation");
+
+    return tests;
+}
+
 pub fn build(b: *std.Build) void {
     b.sysroot = detectSdkRoot(b);
 
@@ -70,6 +95,11 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run zatt");
     run_step.dependOn(&run_cmd.step);
+
+    const tests = addBatteryTests(b, target, optimize);
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
 
     const release_target = b.resolveTargetQuery(.{
         .cpu_arch = .aarch64,
