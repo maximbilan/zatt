@@ -2,11 +2,19 @@ const std = @import("std");
 const smc = @import("smc.zig");
 const c = smc.c;
 
+const page_allocator = std.heap.page_allocator;
+const menu_bar_note = "menu bar icon can lag by 1-2 min after a real battery current change";
+
 pub const Error = smc.Error || error{
     BatteryNotFound,
     InvalidCapacity,
     OutputFailed,
     PowerSourceUnavailable,
+};
+
+pub const WriteOptions = struct {
+    wait: bool = false,
+    notify: bool = false,
 };
 
 const PowerSourceInfo = struct {
@@ -52,6 +60,14 @@ const ChargingSnapshot = struct {
     plugged_in: bool,
 };
 
+const BatteryState = struct {
+    power: PowerSourceInfo,
+    registry: RegistryInfo,
+    charging_inhibit: ChargingInhibitProbe,
+    charge_limit: ?ChargeLimitProbe,
+    actual_charging: bool,
+};
+
 const ChargeLimitProbe = struct {
     key_name: []const u8,
     raw_value: u8,
@@ -69,18 +85,33 @@ const VerificationAction = enum {
     enable,
 };
 
-pub fn disable() Error!void {
+const ObservationPlan = struct {
+    interval_ms: u32,
+    max_wait_ms: u32,
+};
+
+const WriteObservation = struct {
+    snapshot: ChargingSnapshot,
+    elapsed_ms: u32,
+    settled: bool,
+};
+
+pub fn disable(options: WriteOptions) Error!void {
     var session = try smc.Session.open();
     defer session.close();
     try writeChargingInhibit(&session, true);
-    try verifyChargingTransition(&session, .disable);
+    const observation = try observeChargingTransition(&session, .disable, options);
+    try printVerificationResult(.disable, observation, options.wait);
+    if (options.notify) sendWriteNotification(.disable, observation);
 }
 
-pub fn enable() Error!void {
+pub fn enable(options: WriteOptions) Error!void {
     var session = try smc.Session.open();
     defer session.close();
     try writeChargingInhibit(&session, false);
-    try verifyChargingTransition(&session, .enable);
+    const observation = try observeChargingTransition(&session, .enable, options);
+    try printVerificationResult(.enable, observation, options.wait);
+    if (options.notify) sendWriteNotification(.enable, observation);
 }
 
 pub fn setLimit(limit: u8) smc.Error!void {
@@ -96,65 +127,14 @@ pub fn resetLimit() smc.Error!void {
 pub fn status() Error!void {
     var session = try smc.Session.open();
     defer session.close();
-
-    const charging_inhibit = try probeChargingInhibit(&session);
-    const limit = probeChargeLimit(&session) catch |err| switch (err) {
-        error.KeyNotFound => null,
-        else => return err,
-    };
-    const info = try readPowerSourceInfo();
-
-    var buffer: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    const writer = stream.writer();
-
-    writer.writeAll("══════════════════════════════\n") catch unreachable;
-    writer.writeAll("  Battery Status\n") catch unreachable;
-    writer.writeAll("══════════════════════════════\n") catch unreachable;
-
-    const filled = chargeBarSegments(info.percent);
-    writer.writeAll("  Charge:       ") catch unreachable;
-    for (0..10) |index| {
-        writer.writeAll(if (index < filled) "█" else "░") catch unreachable;
-    }
-    writer.print(" {d}%\n", .{info.percent}) catch unreachable;
-
-    const charging_label = chargingStatusLabel(charging_inhibit.inhibited, info.is_charging);
-    writer.print("  Charging:     {s}\n", .{charging_label}) catch unreachable;
-    writer.print("  Plugged in:   {s}\n", .{if (info.plugged_in) "yes" else "no"}) catch unreachable;
-    writer.print("  Health:       {s}\n", .{healthSlice(&info)}) catch unreachable;
-
-    if (info.cycles) |cycles| {
-        writer.print("  Cycles:       {d}\n", .{cycles}) catch unreachable;
-    } else {
-        writer.writeAll("  Cycles:       Unknown\n") catch unreachable;
-    }
-
-    if (limit) |charge_limit| {
-        if (charge_limit.interpreted_limit == 100) {
-            writer.writeAll("  Limit:        none\n") catch unreachable;
-        } else {
-            writer.print("  Limit:        {d}%\n", .{charge_limit.interpreted_limit}) catch unreachable;
-        }
-    } else {
-        writer.writeAll("  Limit:        none\n") catch unreachable;
-    }
-
-    writer.writeAll("══════════════════════════════\n") catch unreachable;
-    std.fs.File.stdout().writeAll(stream.getWritten()) catch return error.OutputFailed;
+    const state = try readBatteryState(&session);
+    try writeBatteryOverview("Battery Status", state, false);
 }
 
 pub fn debug() Error!void {
     var session = try smc.Session.open();
     defer session.close();
-
-    const power = try readPowerSourceInfo();
-    const registry = readBatteryRegistryInfo();
-    const charging_inhibit = try probeChargingInhibit(&session);
-    const charge_limit = probeChargeLimit(&session) catch |err| switch (err) {
-        error.KeyNotFound => null,
-        else => return err,
-    };
+    const state = try readBatteryState(&session);
 
     var buffer: [4096]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
@@ -164,13 +144,13 @@ pub fn debug() Error!void {
     writer.writeAll("  Charging Diagnostics\n") catch unreachable;
     writer.writeAll("══════════════════════════════\n") catch unreachable;
     writer.print("  SMC inhibit:   {s} via {s} = ", .{
-        if (charging_inhibit.inhibited) "enabled" else "disabled",
-        charging_inhibit.key_name,
+        if (state.charging_inhibit.inhibited) "enabled" else "disabled",
+        state.charging_inhibit.key_name,
     }) catch unreachable;
-    writeHexBytes(writer, charging_inhibit.bytes[0..charging_inhibit.byte_len]);
+    writeHexBytes(writer, state.charging_inhibit.bytes[0..state.charging_inhibit.byte_len]);
     writer.writeAll("\n") catch unreachable;
 
-    if (charge_limit) |limit| {
+    if (state.charge_limit) |limit| {
         writer.print("  Charge limit:  {d}% via {s} = 0x{x:0>2}\n", .{
             limit.interpreted_limit,
             limit.key_name,
@@ -180,30 +160,29 @@ pub fn debug() Error!void {
         writer.writeAll("  Charge limit:  unavailable on this Mac\n") catch unreachable;
     }
 
-    const effective_is_charging = registry.is_charging orelse power.is_charging;
-    const charging_current = registry.charging_current;
-    const pack_state = packStateLabel(effective_is_charging, charging_current);
+    const charging_current = state.registry.charging_current;
+    const pack_state = packStateLabel(state.actual_charging, charging_current);
 
     writer.print("  Pack state:    {s}\n", .{pack_state}) catch unreachable;
-    writer.print("  Charging now:  {s}\n", .{yesNo(effectiveIsCharging(effective_is_charging, charging_current))}) catch unreachable;
+    writer.print("  Actual charging: {s}\n", .{actualChargingLabel(state.charging_inhibit.inhibited, state.actual_charging)}) catch unreachable;
     writer.print("  Charge current:{s}", .{if (charging_current != null) " " else " unavailable\n"}) catch unreachable;
     if (charging_current) |current| {
         writer.print("{d} mA\n", .{current}) catch unreachable;
     }
-    writer.print("  Fully charged: {s}\n", .{yesNo(registry.fully_charged orelse (power.percent == 100))}) catch unreachable;
-    writer.print("  Plugged in:    {s}\n", .{yesNo(registry.external_connected orelse power.plugged_in)}) catch unreachable;
+    writer.print("  Fully charged: {s}\n", .{yesNo(state.registry.fully_charged orelse (state.power.percent == 100))}) catch unreachable;
+    writer.print("  Plugged in:    {s}\n", .{yesNo(state.registry.external_connected orelse state.power.plugged_in)}) catch unreachable;
 
     writer.writeAll("  Verdict:       ") catch unreachable;
     writer.writeAll(debugVerdict(
-        effectiveIsCharging(effective_is_charging, charging_current),
-        registry.fully_charged orelse false,
-        power.percent,
-        charging_inhibit.inhibited,
+        state.actual_charging,
+        state.registry.fully_charged orelse false,
+        state.power.percent,
+        state.charging_inhibit.inhibited,
     )) catch unreachable;
     writer.writeAll("\n") catch unreachable;
 
-    writer.writeAll("  UI note:       macOS can show the power icon when AC is attached even if charging current is zero\n") catch unreachable;
-    if ((registry.fully_charged orelse false) or power.percent == 100) {
+    writer.print("  Menu bar note: {s}\n", .{menu_bar_note}) catch unreachable;
+    if ((state.registry.fully_charged orelse false) or state.power.percent == 100) {
         writer.writeAll("  Test note:     at 100% this does not prove inhibit works; discharge below 95% and rerun\n") catch unreachable;
     }
 
@@ -211,12 +190,38 @@ pub fn debug() Error!void {
     std.fs.File.stdout().writeAll(stream.getWritten()) catch return error.OutputFailed;
 }
 
+pub fn watch() Error!void {
+    while (true) {
+        var session = try smc.Session.open();
+        defer session.close();
+
+        const state = try readBatteryState(&session);
+
+        var buffer: [2048]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&buffer);
+        const writer = stream.writer();
+
+        writer.writeAll("\x1b[2J\x1b[H") catch unreachable;
+        writer.writeAll("══════════════════════════════\n") catch unreachable;
+        writer.writeAll("  Battery Watch\n") catch unreachable;
+        writer.writeAll("══════════════════════════════\n") catch unreachable;
+
+        writeBatteryOverviewBody(writer, state);
+
+        writer.writeAll("  Refresh:       every 1s\n") catch unreachable;
+        writer.writeAll("  Exit:          Ctrl-C\n") catch unreachable;
+        writer.writeAll("══════════════════════════════\n") catch unreachable;
+
+        std.fs.File.stdout().writeAll(stream.getWritten()) catch return error.OutputFailed;
+        std.Thread.sleep(std.time.ns_per_s);
+    }
+}
+
 pub fn rawStatus() Error!void {
     var session = try smc.Session.open();
     defer session.close();
 
-    const power = try readPowerSourceInfo();
-    const registry = readBatteryRegistryInfo();
+    const state = try readBatteryState(&session);
 
     var buffer: [8192]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
@@ -227,29 +232,29 @@ pub fn rawStatus() Error!void {
     writer.writeAll("══════════════════════════════\n") catch unreachable;
 
     writer.writeAll("  IOPS\n") catch unreachable;
-    writer.print("    CurrentCapacity:    {d}\n", .{power.current_capacity}) catch unreachable;
-    writer.print("    MaxCapacity:        {d}\n", .{power.max_capacity}) catch unreachable;
-    writer.print("    Percent:            {d}\n", .{power.percent}) catch unreachable;
-    writer.print("    IsCharging:         {s}\n", .{yesNo(power.is_charging)}) catch unreachable;
-    writer.print("    PowerSourceState:   {s}\n", .{powerStateSlice(&power)}) catch unreachable;
-    writer.print("    Health:             {s}\n", .{healthSlice(&power)}) catch unreachable;
-    if (power.cycles) |cycles| {
+    writer.print("    CurrentCapacity:    {d}\n", .{state.power.current_capacity}) catch unreachable;
+    writer.print("    MaxCapacity:        {d}\n", .{state.power.max_capacity}) catch unreachable;
+    writer.print("    Percent:            {d}\n", .{state.power.percent}) catch unreachable;
+    writer.print("    IsCharging:         {s}\n", .{yesNo(state.power.is_charging)}) catch unreachable;
+    writer.print("    PowerSourceState:   {s}\n", .{powerStateSlice(&state.power)}) catch unreachable;
+    writer.print("    Health:             {s}\n", .{healthSlice(&state.power)}) catch unreachable;
+    if (state.power.cycles) |cycles| {
         writer.print("    CycleCount:         {d}\n", .{cycles}) catch unreachable;
     } else {
         writer.writeAll("    CycleCount:         unavailable\n") catch unreachable;
     }
 
     writer.writeAll("  AppleSmartBattery\n") catch unreachable;
-    writeMaybeInt(writer, "    CurrentCapacity", registry.current_capacity);
-    writeMaybeInt(writer, "    MaxCapacity", registry.max_capacity);
-    writeMaybeInt(writer, "    CycleCount", registry.cycle_count);
-    writeMaybeBool(writer, "    IsCharging", registry.is_charging);
-    writeMaybeBool(writer, "    FullyCharged", registry.fully_charged);
-    writeMaybeBool(writer, "    ExternalConnected", registry.external_connected);
-    writeMaybeBool(writer, "    ExternalChargeCapable", registry.external_charge_capable);
-    writeMaybeInt(writer, "    ChargingCurrent", registry.charging_current);
-    writeMaybeInt(writer, "    ChargerInhibitReason", registry.charger_inhibit_reason);
-    writeMaybeInt(writer, "    NotChargingReason", registry.not_charging_reason);
+    writeMaybeInt(writer, "    CurrentCapacity", state.registry.current_capacity);
+    writeMaybeInt(writer, "    MaxCapacity", state.registry.max_capacity);
+    writeMaybeInt(writer, "    CycleCount", state.registry.cycle_count);
+    writeMaybeBool(writer, "    IsCharging", state.registry.is_charging);
+    writeMaybeBool(writer, "    FullyCharged", state.registry.fully_charged);
+    writeMaybeBool(writer, "    ExternalConnected", state.registry.external_connected);
+    writeMaybeBool(writer, "    ExternalChargeCapable", state.registry.external_charge_capable);
+    writeMaybeInt(writer, "    ChargingCurrent", state.registry.charging_current);
+    writeMaybeInt(writer, "    ChargerInhibitReason", state.registry.charger_inhibit_reason);
+    writeMaybeInt(writer, "    NotChargingReason", state.registry.not_charging_reason);
 
     writer.writeAll("  SMC\n") catch unreachable;
     writeSmcProbe(writer, &session, "CH0B");
@@ -260,6 +265,85 @@ pub fn rawStatus() Error!void {
 
     writer.writeAll("══════════════════════════════\n") catch unreachable;
     std.fs.File.stdout().writeAll(stream.getWritten()) catch return error.OutputFailed;
+}
+
+fn readBatteryState(session: *smc.Session) Error!BatteryState {
+    const power = try readPowerSourceInfo();
+    const registry = readBatteryRegistryInfo();
+    const charging_inhibit = try probeChargingInhibit(session);
+    const charge_limit = probeChargeLimit(session) catch |err| switch (err) {
+        error.KeyNotFound => null,
+        else => return err,
+    };
+
+    return .{
+        .power = power,
+        .registry = registry,
+        .charging_inhibit = charging_inhibit,
+        .charge_limit = charge_limit,
+        .actual_charging = effectiveIsCharging(
+            registry.is_charging orelse power.is_charging,
+            registry.charging_current,
+        ),
+    };
+}
+
+fn writeBatteryOverview(title: []const u8, state: BatteryState, watch_mode: bool) Error!void {
+    var buffer: [2048]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    const writer = stream.writer();
+
+    writer.writeAll("══════════════════════════════\n") catch unreachable;
+    writer.print("  {s}\n", .{title}) catch unreachable;
+    writer.writeAll("══════════════════════════════\n") catch unreachable;
+    writeBatteryOverviewBody(writer, state);
+    if (!watch_mode) {
+        writer.writeAll("══════════════════════════════\n") catch unreachable;
+    }
+
+    std.fs.File.stdout().writeAll(stream.getWritten()) catch return error.OutputFailed;
+}
+
+fn writeBatteryOverviewBody(writer: anytype, state: BatteryState) void {
+    const filled = chargeBarSegments(state.power.percent);
+    writer.writeAll("  Charge:           ") catch unreachable;
+    for (0..10) |index| {
+        writer.writeAll(if (index < filled) "█" else "░") catch unreachable;
+    }
+    writer.print(" {d}%\n", .{state.power.percent}) catch unreachable;
+
+    writer.print("  Actual charging:  {s}\n", .{
+        actualChargingLabel(state.charging_inhibit.inhibited, state.actual_charging),
+    }) catch unreachable;
+    writer.print("  Charge current:{s}", .{
+        if (state.registry.charging_current != null) "   " else "   unavailable\n",
+    }) catch unreachable;
+    if (state.registry.charging_current) |current| {
+        writer.print("{d} mA\n", .{current}) catch unreachable;
+    }
+    writer.print("  SMC inhibit:      {s}\n", .{
+        if (state.charging_inhibit.inhibited) "enabled" else "disabled",
+    }) catch unreachable;
+    writer.print("  Plugged in:       {s}\n", .{yesNo(state.registry.external_connected orelse state.power.plugged_in)}) catch unreachable;
+    writer.print("  Health:           {s}\n", .{healthSlice(&state.power)}) catch unreachable;
+
+    if (state.power.cycles) |cycles| {
+        writer.print("  Cycles:           {d}\n", .{cycles}) catch unreachable;
+    } else {
+        writer.writeAll("  Cycles:           Unknown\n") catch unreachable;
+    }
+
+    if (state.charge_limit) |charge_limit| {
+        if (charge_limit.interpreted_limit == 100) {
+            writer.writeAll("  Limit:            none\n") catch unreachable;
+        } else {
+            writer.print("  Limit:            {d}%\n", .{charge_limit.interpreted_limit}) catch unreachable;
+        }
+    } else {
+        writer.writeAll("  Limit:            none\n") catch unreachable;
+    }
+
+    writer.print("  Menu bar note:    {s}\n", .{menu_bar_note}) catch unreachable;
 }
 
 fn readPowerSourceInfo() Error!PowerSourceInfo {
@@ -330,9 +414,9 @@ fn chargeBarSegments(percent: u8) usize {
     return @min(@as(usize, 10), @divTrunc(@as(usize, percent) + 9, 10));
 }
 
-fn chargingStatusLabel(inhibited: bool, is_charging: bool) []const u8 {
-    if (inhibited) return "disabled (inhibited)";
-    return if (is_charging) "charging" else "not charging";
+fn actualChargingLabel(inhibited: bool, is_charging: bool) []const u8 {
+    if (inhibited) return "no (inhibited)";
+    return if (is_charging) "yes" else "no";
 }
 
 fn readChargingInhibit(session: *smc.Session) smc.Error!bool {
@@ -394,42 +478,55 @@ fn writeChargingInhibitFallback(session: *smc.Session, disabled: bool) smc.Error
     };
 }
 
-fn verifyChargingTransition(session: *smc.Session, action: VerificationAction) Error!void {
-    const max_polls: usize = 12;
-    const sleep_ns: u64 = 500 * std.time.ns_per_ms;
+fn observeChargingTransition(
+    session: *smc.Session,
+    action: VerificationAction,
+    options: WriteOptions,
+) Error!WriteObservation {
+    const plan = observationPlan(options.wait);
 
     var elapsed_ms: u32 = 0;
     var snapshot = try captureChargingSnapshot(session);
     var settled = verificationSatisfied(action, snapshot);
 
-    var poll_index: usize = 1;
-    while (!settled and poll_index < max_polls) : (poll_index += 1) {
-        std.Thread.sleep(sleep_ns);
-        elapsed_ms += 500;
+    while (!settled and elapsed_ms < plan.max_wait_ms) {
+        std.Thread.sleep(@as(u64, plan.interval_ms) * std.time.ns_per_ms);
+        elapsed_ms += plan.interval_ms;
         snapshot = try captureChargingSnapshot(session);
         settled = verificationSatisfied(action, snapshot);
     }
 
-    try printVerificationResult(action, snapshot, elapsed_ms, settled);
+    return .{
+        .snapshot = snapshot,
+        .elapsed_ms = elapsed_ms,
+        .settled = settled,
+    };
+}
+
+fn observationPlan(wait: bool) ObservationPlan {
+    return if (wait)
+        .{
+            .interval_ms = 1000,
+            .max_wait_ms = 120_000,
+        }
+    else
+        .{
+            .interval_ms = 250,
+            .max_wait_ms = 750,
+        };
 }
 
 fn captureChargingSnapshot(session: *smc.Session) Error!ChargingSnapshot {
-    const power = try readPowerSourceInfo();
-    const registry = readBatteryRegistryInfo();
-    const inhibit = try probeChargingInhibit(session);
-    const effective_is_charging = effectiveIsCharging(
-        registry.is_charging orelse power.is_charging,
-        registry.charging_current,
-    );
+    const state = try readBatteryState(session);
 
     return .{
-        .key_name = inhibit.key_name,
-        .inhibited = inhibit.inhibited,
-        .charging_now = effective_is_charging,
-        .charging_current = registry.charging_current,
-        .fully_charged = registry.fully_charged orelse (power.percent == 100),
-        .percent = power.percent,
-        .plugged_in = registry.external_connected orelse power.plugged_in,
+        .key_name = state.charging_inhibit.key_name,
+        .inhibited = state.charging_inhibit.inhibited,
+        .charging_now = state.actual_charging,
+        .charging_current = state.registry.charging_current,
+        .fully_charged = state.registry.fully_charged orelse (state.power.percent == 100),
+        .percent = state.power.percent,
+        .plugged_in = state.registry.external_connected orelse state.power.plugged_in,
     };
 }
 
@@ -447,37 +544,37 @@ fn shouldExpectCharging(snapshot: ChargingSnapshot) bool {
 fn verificationResult(action: VerificationAction, snapshot: ChargingSnapshot, settled: bool) []const u8 {
     return switch (action) {
         .disable => if (!snapshot.inhibited)
-            "write returned, but charging inhibit is not reflected yet"
+            "SMC write returned, but charging inhibit is not reflected yet"
         else if (snapshot.charging_now)
-            "inhibit is enabled, but charging current is still flowing"
+            "SMC inhibit is enabled, but battery current is still flowing"
         else if (settled)
-            "charging inhibit is active"
+            "battery current stopped and charging inhibit is active"
         else
-            "charging stopped, but verification did not fully settle",
+            "battery current stopped, but verification did not fully settle",
         .enable => if (snapshot.inhibited)
-            "write returned, but charging inhibit is still enabled"
+            "SMC write returned, but charging inhibit is still enabled"
         else if (!snapshot.plugged_in)
             "inhibit cleared; AC power is not connected"
         else if (snapshot.fully_charged or snapshot.percent == 100)
-            "inhibit cleared; battery is full, so charging current may stay at zero"
+            "inhibit cleared; battery is full, so current may stay at 0 mA"
         else if (snapshot.charging_now)
-            "charging resumed"
+            "battery current resumed"
         else if (settled)
             "inhibit cleared, but charging is not expected right now"
         else
-            "inhibit cleared, but charging has not resumed yet",
+            "inhibit cleared, but battery current has not resumed yet",
     };
 }
 
 fn printVerificationResult(
     action: VerificationAction,
-    snapshot: ChargingSnapshot,
-    elapsed_ms: u32,
-    settled: bool,
+    observation: WriteObservation,
+    waited_for_settle: bool,
 ) Error!void {
     var buffer: [512]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
     const writer = stream.writer();
+    const snapshot = observation.snapshot;
 
     writer.writeAll("══════════════════════════════\n") catch unreachable;
     writer.print("  Charging {s} Result\n", .{
@@ -489,22 +586,83 @@ fn printVerificationResult(
         snapshot.key_name,
     }) catch unreachable;
     writer.print("  Plugged in:    {s}\n", .{yesNo(snapshot.plugged_in)}) catch unreachable;
-    writer.print("  Charging now:  {s}\n", .{yesNo(snapshot.charging_now)}) catch unreachable;
+    writer.print("  Actual charging: {s}\n", .{actualChargingLabel(snapshot.inhibited, snapshot.charging_now)}) catch unreachable;
     if (snapshot.charging_current) |current| {
         writer.print("  Charge current:{d: >5} mA\n", .{current}) catch unreachable;
     } else {
         writer.writeAll("  Charge current: unavailable\n") catch unreachable;
     }
-    writer.print("  Waited:        {d}.{d:0>1}s\n", .{
-        elapsed_ms / 1000,
-        (elapsed_ms % 1000) / 100,
+    writer.print("  Observed:      {d}.{d:0>1}s\n", .{
+        observation.elapsed_ms / 1000,
+        (observation.elapsed_ms % 1000) / 100,
     }) catch unreachable;
     writer.print("  Result:        {s}\n", .{
-        verificationResult(action, snapshot, settled),
+        verificationResult(action, snapshot, observation.settled),
     }) catch unreachable;
+    writer.print("  Menu bar note: {s}\n", .{menu_bar_note}) catch unreachable;
+    if (!waited_for_settle and !observation.settled) {
+        writer.writeAll("  Hint:          use --wait or `zatt watch` for live confirmation\n") catch unreachable;
+    }
     writer.writeAll("══════════════════════════════\n") catch unreachable;
 
     std.fs.File.stdout().writeAll(stream.getWritten()) catch return error.OutputFailed;
+}
+
+fn sendWriteNotification(action: VerificationAction, observation: WriteObservation) void {
+    var uid_buf: [16]u8 = undefined;
+    const target_uid = notificationTargetUid() orelse return;
+    const uid = std.fmt.bufPrint(&uid_buf, "{d}", .{target_uid}) catch return;
+
+    const title = switch (action) {
+        .enable => "zatt enable",
+        .disable => "zatt disable",
+    };
+    const body = notificationBody(action, observation);
+
+    var script_buf: [256]u8 = undefined;
+    const script = std.fmt.bufPrint(
+        &script_buf,
+        "display notification \"{s}\" with title \"{s}\"",
+        .{ body, title },
+    ) catch return;
+
+    const argv = [_][]const u8{
+        "/bin/launchctl",
+        "asuser",
+        uid,
+        "/usr/bin/osascript",
+        "-e",
+        script,
+    };
+
+    var child = std.process.Child.init(&argv, page_allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    _ = child.spawnAndWait() catch {};
+}
+
+fn notificationTargetUid() ?u32 {
+    const value = std.process.getEnvVarOwned(page_allocator, "SUDO_UID") catch return null;
+    defer page_allocator.free(value);
+    return std.fmt.parseUnsigned(u32, value, 10) catch null;
+}
+
+fn notificationBody(action: VerificationAction, observation: WriteObservation) []const u8 {
+    if (observation.settled) {
+        return switch (action) {
+            .enable => if (observation.snapshot.charging_now)
+                "Battery current resumed"
+            else
+                "Charging state settled",
+            .disable => "Battery current stopped",
+        };
+    }
+
+    return switch (action) {
+        .enable => "Charging state is still settling",
+        .disable => "Disable state is still settling",
+    };
 }
 
 fn readChargeLimit(session: *smc.Session) smc.Error!u8 {
@@ -724,10 +882,10 @@ test "charge bar segments round up to percentage buckets" {
     try std.testing.expectEqual(@as(usize, 10), chargeBarSegments(100));
 }
 
-test "charging status label prioritizes inhibit state" {
-    try std.testing.expectEqualStrings("disabled (inhibited)", chargingStatusLabel(true, true));
-    try std.testing.expectEqualStrings("charging", chargingStatusLabel(false, true));
-    try std.testing.expectEqualStrings("not charging", chargingStatusLabel(false, false));
+test "actual charging label prioritizes inhibit state" {
+    try std.testing.expectEqualStrings("no (inhibited)", actualChargingLabel(true, true));
+    try std.testing.expectEqualStrings("yes", actualChargingLabel(false, true));
+    try std.testing.expectEqualStrings("no", actualChargingLabel(false, false));
 }
 
 test "pack state label reflects charging current and fallback state" {
@@ -797,7 +955,7 @@ test "enable verification waits for charging only when it should" {
 
 test "verification results explain post-write battery state" {
     try std.testing.expectEqualStrings(
-        "charging resumed",
+        "battery current resumed",
         verificationResult(.enable, .{
             .key_name = "CHTE",
             .inhibited = false,
@@ -821,7 +979,7 @@ test "verification results explain post-write battery state" {
         }, true),
     );
     try std.testing.expectEqualStrings(
-        "charging inhibit is active",
+        "battery current stopped and charging inhibit is active",
         verificationResult(.disable, .{
             .key_name = "CHTE",
             .inhibited = true,
@@ -831,5 +989,50 @@ test "verification results explain post-write battery state" {
             .percent = 80,
             .plugged_in = true,
         }, true),
+    );
+}
+
+test "observation plan keeps default writes fast and wait mode long-lived" {
+    const quick = observationPlan(false);
+    try std.testing.expectEqual(@as(u32, 250), quick.interval_ms);
+    try std.testing.expectEqual(@as(u32, 750), quick.max_wait_ms);
+
+    const wait = observationPlan(true);
+    try std.testing.expectEqual(@as(u32, 1000), wait.interval_ms);
+    try std.testing.expectEqual(@as(u32, 120_000), wait.max_wait_ms);
+}
+
+test "notification body reflects settled and unsettled states" {
+    try std.testing.expectEqualStrings(
+        "Battery current resumed",
+        notificationBody(.enable, .{
+            .snapshot = .{
+                .key_name = "CHTE",
+                .inhibited = false,
+                .charging_now = true,
+                .charging_current = 1500,
+                .fully_charged = false,
+                .percent = 80,
+                .plugged_in = true,
+            },
+            .elapsed_ms = 1000,
+            .settled = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "Charging state is still settling",
+        notificationBody(.enable, .{
+            .snapshot = .{
+                .key_name = "CHTE",
+                .inhibited = false,
+                .charging_now = false,
+                .charging_current = 0,
+                .fully_charged = false,
+                .percent = 80,
+                .plugged_in = true,
+            },
+            .elapsed_ms = 250,
+            .settled = false,
+        }),
     );
 }

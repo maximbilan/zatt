@@ -17,10 +17,13 @@ repository is named `homebrew-<repo>`. Because this project lives in
 
 ```bash
 zatt status
+zatt watch
 zatt debug
 zatt raw-status
 sudo zatt disable
+sudo zatt disable --wait
 sudo zatt enable
+sudo zatt enable --wait --notify
 sudo zatt limit 80
 sudo zatt limit reset
 ```
@@ -28,6 +31,14 @@ sudo zatt limit reset
 `zatt debug` prints an interpreted charging diagnostic view for local testing.
 `zatt raw-status` dumps the raw IOPS, `AppleSmartBattery`, and SMC fields that
 back the charging state.
+`zatt watch` refreshes the real battery charging state every second so you do
+not need to wait for the macOS menu bar icon to catch up.
+
+Write-command options:
+
+- `--wait`: keep polling until the observed battery current settles or the wait
+  timeout is reached
+- `--notify`: send a macOS notification with the final observed result
 
 ## Build
 

@@ -5,10 +5,11 @@ const smc = @import("smc.zig");
 const usage_text =
     \\Usage:
     \\  zatt status
+    \\  zatt watch
     \\  zatt debug
     \\  zatt raw-status
-    \\  zatt disable
-    \\  zatt enable
+    \\  zatt disable [--wait] [--notify]
+    \\  zatt enable [--wait] [--notify]
     \\  zatt limit <20-100>
     \\  zatt limit reset
     \\
@@ -38,21 +39,26 @@ fn run() u8 {
         return readOnlyCommand(battery.debug);
     }
 
+    if (std.mem.eql(u8, command, "watch")) {
+        if (args.next() != null) return usageError();
+        return readOnlyCommand(battery.watch);
+    }
+
     if (std.mem.eql(u8, command, "raw-status")) {
         if (args.next() != null) return usageError();
         return readOnlyCommand(battery.rawStatus);
     }
 
     if (std.mem.eql(u8, command, "disable")) {
-        if (args.next() != null) return usageError();
+        const options = parseWriteOptions(&args) orelse return usageError();
         if (!isRoot()) return fail("Error: run with sudo\n", .{});
-        return writeBatteryCommand("CH0B", battery.disable);
+        return writeBatteryCommand("CH0B", options, battery.disable);
     }
 
     if (std.mem.eql(u8, command, "enable")) {
-        if (args.next() != null) return usageError();
+        const options = parseWriteOptions(&args) orelse return usageError();
         if (!isRoot()) return fail("Error: run with sudo\n", .{});
-        return writeBatteryCommand("CH0B", battery.enable);
+        return writeBatteryCommand("CH0B", options, battery.enable);
     }
 
     if (std.mem.eql(u8, command, "limit")) {
@@ -112,8 +118,12 @@ fn writeSmcCommand(comptime key: []const u8, comptime action: fn () smc.Error!vo
     return 0;
 }
 
-fn writeBatteryCommand(comptime key: []const u8, comptime action: fn () battery.Error!void) u8 {
-    action() catch |err| {
+fn writeBatteryCommand(
+    comptime key: []const u8,
+    options: battery.WriteOptions,
+    comptime action: fn (battery.WriteOptions) battery.Error!void,
+) u8 {
+    action(options) catch |err| {
         return switch (err) {
             error.CannotOpen => fail("Error: cannot open SMC\n", .{}),
             error.NotPrivileged => fail("Error: run with sudo\n", .{}),
@@ -126,6 +136,24 @@ fn writeBatteryCommand(comptime key: []const u8, comptime action: fn () battery.
         };
     };
     return 0;
+}
+
+fn parseWriteOptions(args: anytype) ?battery.WriteOptions {
+    var options = battery.WriteOptions{};
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--wait")) {
+            options.wait = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--notify")) {
+            options.notify = true;
+            continue;
+        }
+        return null;
+    }
+
+    return options;
 }
 
 fn usageError() u8 {
