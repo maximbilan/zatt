@@ -29,6 +29,7 @@ back the charging state.
 
 ```bash
 zig build
+zig build test
 zig build release
 ```
 
