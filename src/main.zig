@@ -46,13 +46,13 @@ fn run() u8 {
     if (std.mem.eql(u8, command, "disable")) {
         if (args.next() != null) return usageError();
         if (!isRoot()) return fail("Error: run with sudo\n", .{});
-        return writeCommand("CH0B", battery.disable);
+        return writeBatteryCommand("CH0B", battery.disable);
     }
 
     if (std.mem.eql(u8, command, "enable")) {
         if (args.next() != null) return usageError();
         if (!isRoot()) return fail("Error: run with sudo\n", .{});
-        return writeCommand("CH0B", battery.enable);
+        return writeBatteryCommand("CH0B", battery.enable);
     }
 
     if (std.mem.eql(u8, command, "limit")) {
@@ -60,7 +60,7 @@ fn run() u8 {
         if (std.mem.eql(u8, limit_arg, "reset")) {
             if (args.next() != null) return usageError();
             if (!isRoot()) return fail("Error: run with sudo\n", .{});
-            return writeCommand("BCLM", battery.resetLimit);
+            return writeSmcCommand("BCLM", battery.resetLimit);
         }
 
         if (args.next() != null) return usageError();
@@ -101,11 +101,27 @@ fn readOnlyCommand(comptime action: fn () battery.Error!void) u8 {
     return 0;
 }
 
-fn writeCommand(comptime key: []const u8, comptime action: fn () smc.Error!void) u8 {
+fn writeSmcCommand(comptime key: []const u8, comptime action: fn () smc.Error!void) u8 {
     action() catch |err| {
         return switch (err) {
             error.CannotOpen => fail("Error: cannot open SMC\n", .{}),
             error.NotPrivileged => fail("Error: run with sudo\n", .{}),
+            else => fail("Error: SMC write failed for {s}\n", .{key}),
+        };
+    };
+    return 0;
+}
+
+fn writeBatteryCommand(comptime key: []const u8, comptime action: fn () battery.Error!void) u8 {
+    action() catch |err| {
+        return switch (err) {
+            error.CannotOpen => fail("Error: cannot open SMC\n", .{}),
+            error.NotPrivileged => fail("Error: run with sudo\n", .{}),
+            error.BatteryNotFound,
+            error.InvalidCapacity,
+            error.PowerSourceUnavailable,
+            error.OutputFailed,
+            => fail("Error: cannot verify battery status\n", .{}),
             else => fail("Error: SMC write failed for {s}\n", .{key}),
         };
     };

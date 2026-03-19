@@ -42,6 +42,16 @@ const ChargingInhibitProbe = struct {
     inhibited: bool,
 };
 
+const ChargingSnapshot = struct {
+    key_name: []const u8,
+    inhibited: bool,
+    charging_now: bool,
+    charging_current: ?i64,
+    fully_charged: bool,
+    percent: u8,
+    plugged_in: bool,
+};
+
 const ChargeLimitProbe = struct {
     key_name: []const u8,
     raw_value: u8,
@@ -54,16 +64,23 @@ const SmcProbeStatus = enum {
     read_failed,
 };
 
-pub fn disable() smc.Error!void {
+const VerificationAction = enum {
+    disable,
+    enable,
+};
+
+pub fn disable() Error!void {
     var session = try smc.Session.open();
     defer session.close();
     try writeChargingInhibit(&session, true);
+    try verifyChargingTransition(&session, .disable);
 }
 
-pub fn enable() smc.Error!void {
+pub fn enable() Error!void {
     var session = try smc.Session.open();
     defer session.close();
     try writeChargingInhibit(&session, false);
+    try verifyChargingTransition(&session, .enable);
 }
 
 pub fn setLimit(limit: u8) smc.Error!void {
@@ -377,6 +394,119 @@ fn writeChargingInhibitFallback(session: *smc.Session, disabled: bool) smc.Error
     };
 }
 
+fn verifyChargingTransition(session: *smc.Session, action: VerificationAction) Error!void {
+    const max_polls: usize = 12;
+    const sleep_ns: u64 = 500 * std.time.ns_per_ms;
+
+    var elapsed_ms: u32 = 0;
+    var snapshot = try captureChargingSnapshot(session);
+    var settled = verificationSatisfied(action, snapshot);
+
+    var poll_index: usize = 1;
+    while (!settled and poll_index < max_polls) : (poll_index += 1) {
+        std.Thread.sleep(sleep_ns);
+        elapsed_ms += 500;
+        snapshot = try captureChargingSnapshot(session);
+        settled = verificationSatisfied(action, snapshot);
+    }
+
+    try printVerificationResult(action, snapshot, elapsed_ms, settled);
+}
+
+fn captureChargingSnapshot(session: *smc.Session) Error!ChargingSnapshot {
+    const power = try readPowerSourceInfo();
+    const registry = readBatteryRegistryInfo();
+    const inhibit = try probeChargingInhibit(session);
+    const effective_is_charging = effectiveIsCharging(
+        registry.is_charging orelse power.is_charging,
+        registry.charging_current,
+    );
+
+    return .{
+        .key_name = inhibit.key_name,
+        .inhibited = inhibit.inhibited,
+        .charging_now = effective_is_charging,
+        .charging_current = registry.charging_current,
+        .fully_charged = registry.fully_charged orelse (power.percent == 100),
+        .percent = power.percent,
+        .plugged_in = registry.external_connected orelse power.plugged_in,
+    };
+}
+
+fn verificationSatisfied(action: VerificationAction, snapshot: ChargingSnapshot) bool {
+    return switch (action) {
+        .disable => snapshot.inhibited and !snapshot.charging_now,
+        .enable => !snapshot.inhibited and (!shouldExpectCharging(snapshot) or snapshot.charging_now),
+    };
+}
+
+fn shouldExpectCharging(snapshot: ChargingSnapshot) bool {
+    return snapshot.plugged_in and !snapshot.fully_charged and snapshot.percent < 100;
+}
+
+fn verificationResult(action: VerificationAction, snapshot: ChargingSnapshot, settled: bool) []const u8 {
+    return switch (action) {
+        .disable => if (!snapshot.inhibited)
+            "write returned, but charging inhibit is not reflected yet"
+        else if (snapshot.charging_now)
+            "inhibit is enabled, but charging current is still flowing"
+        else if (settled)
+            "charging inhibit is active"
+        else
+            "charging stopped, but verification did not fully settle",
+        .enable => if (snapshot.inhibited)
+            "write returned, but charging inhibit is still enabled"
+        else if (!snapshot.plugged_in)
+            "inhibit cleared; AC power is not connected"
+        else if (snapshot.fully_charged or snapshot.percent == 100)
+            "inhibit cleared; battery is full, so charging current may stay at zero"
+        else if (snapshot.charging_now)
+            "charging resumed"
+        else if (settled)
+            "inhibit cleared, but charging is not expected right now"
+        else
+            "inhibit cleared, but charging has not resumed yet",
+    };
+}
+
+fn printVerificationResult(
+    action: VerificationAction,
+    snapshot: ChargingSnapshot,
+    elapsed_ms: u32,
+    settled: bool,
+) Error!void {
+    var buffer: [512]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    const writer = stream.writer();
+
+    writer.writeAll("══════════════════════════════\n") catch unreachable;
+    writer.print("  Charging {s} Result\n", .{
+        if (action == .enable) "Enable" else "Disable",
+    }) catch unreachable;
+    writer.writeAll("══════════════════════════════\n") catch unreachable;
+    writer.print("  SMC inhibit:   {s} via {s}\n", .{
+        if (snapshot.inhibited) "enabled" else "disabled",
+        snapshot.key_name,
+    }) catch unreachable;
+    writer.print("  Plugged in:    {s}\n", .{yesNo(snapshot.plugged_in)}) catch unreachable;
+    writer.print("  Charging now:  {s}\n", .{yesNo(snapshot.charging_now)}) catch unreachable;
+    if (snapshot.charging_current) |current| {
+        writer.print("  Charge current:{d: >5} mA\n", .{current}) catch unreachable;
+    } else {
+        writer.writeAll("  Charge current: unavailable\n") catch unreachable;
+    }
+    writer.print("  Waited:        {d}.{d:0>1}s\n", .{
+        elapsed_ms / 1000,
+        (elapsed_ms % 1000) / 100,
+    }) catch unreachable;
+    writer.print("  Result:        {s}\n", .{
+        verificationResult(action, snapshot, settled),
+    }) catch unreachable;
+    writer.writeAll("══════════════════════════════\n") catch unreachable;
+
+    std.fs.File.stdout().writeAll(stream.getWritten()) catch return error.OutputFailed;
+}
+
 fn readChargeLimit(session: *smc.Session) smc.Error!u8 {
     return (try probeChargeLimit(session)).interpreted_limit;
 }
@@ -639,4 +769,67 @@ test "charge limit fallback interprets Apple Silicon values" {
     try std.testing.expectEqual(@as(u8, 80), interpretChargeLimitFallback(1));
     try std.testing.expectEqual(@as(u8, 100), interpretChargeLimitFallback(0));
     try std.testing.expectEqual(@as(u8, 100), interpretChargeLimitFallback(2));
+}
+
+test "enable verification waits for charging only when it should" {
+    const unplugged = ChargingSnapshot{
+        .key_name = "CHTE",
+        .inhibited = false,
+        .charging_now = false,
+        .charging_current = 0,
+        .fully_charged = false,
+        .percent = 80,
+        .plugged_in = false,
+    };
+    try std.testing.expect(verificationSatisfied(.enable, unplugged));
+
+    const plugged_idle = ChargingSnapshot{
+        .key_name = "CHTE",
+        .inhibited = false,
+        .charging_now = false,
+        .charging_current = 0,
+        .fully_charged = false,
+        .percent = 80,
+        .plugged_in = true,
+    };
+    try std.testing.expect(!verificationSatisfied(.enable, plugged_idle));
+}
+
+test "verification results explain post-write battery state" {
+    try std.testing.expectEqualStrings(
+        "charging resumed",
+        verificationResult(.enable, .{
+            .key_name = "CHTE",
+            .inhibited = false,
+            .charging_now = true,
+            .charging_current = 1500,
+            .fully_charged = false,
+            .percent = 80,
+            .plugged_in = true,
+        }, true),
+    );
+    try std.testing.expectEqualStrings(
+        "inhibit cleared; AC power is not connected",
+        verificationResult(.enable, .{
+            .key_name = "CHTE",
+            .inhibited = false,
+            .charging_now = false,
+            .charging_current = 0,
+            .fully_charged = false,
+            .percent = 80,
+            .plugged_in = false,
+        }, true),
+    );
+    try std.testing.expectEqualStrings(
+        "charging inhibit is active",
+        verificationResult(.disable, .{
+            .key_name = "CHTE",
+            .inhibited = true,
+            .charging_now = false,
+            .charging_current = 0,
+            .fully_charged = false,
+            .percent = 80,
+            .plugged_in = true,
+        }, true),
+    );
 }
