@@ -5,8 +5,14 @@ Minimal macOS CLI for controlling MacBook battery charging over the Apple SMC.
 ## Install
 
 ```bash
-brew tap maximbilan/zatt
-brew install zatt
+brew install maximbilan/zatt/zatt
+```
+
+If you prefer to add the tap explicitly from the same repo:
+
+```bash
+brew tap maximbilan/zatt https://github.com/maximbilan/zatt
+brew install maximbilan/zatt/zatt
 ```
 
 ## Usage
